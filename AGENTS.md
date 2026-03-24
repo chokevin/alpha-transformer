@@ -1,50 +1,47 @@
 # alpha-transformer Agent Instructions
 
-## Training
+## What This Repo Does
+Distributed data collection for LeWM world models. Collects trajectories
+from Gym environments via AKS agent-sandbox pods, outputs HDF5 datasets
+compatible with stable-worldmodel.
 
-Always use the full pipeline for initial training:
+## Data Collection
+
 ```bash
+# Local collection
 source .venv/bin/activate
-python train.py --phase all
+python collect_distributed.py --env pusht --episodes 500 --local --format hdf5
+
+# Distributed via AKS (deploy infra first: ./sandbox/deploy.sh)
+python collect_distributed.py --env pusht --episodes 5000 --batch 15 --parallel 15 --format hdf5
 ```
 
-For iteration on RL only (after SFT):
+## Training (LeWM)
+
+Uses stable-worldmodel for data loading:
+```python
+from stable_worldmodel.data import HDF5Dataset
+ds = HDF5Dataset('pusht_5000', num_steps=16, cache_dir='results')
+```
+
+Or our standalone scripts:
 ```bash
-python train.py --phase rl --rl-episodes 5000
+python train_lewm_pusht.py --phase all --episodes 500
+python train_lewm_snake.py --phase all --episodes 3000
 ```
 
-## Environment
+## AKS Deployment
 
-The commodity trading environment comes from sandbox-arena.
-Clone it alongside this repo:
-```
-~/dev/
-├── alpha-transformer/    # this repo (model)
-└── sandbox-arena/        # environment + platform
-```
-
-## Distributed Training
-
-For large-scale RL, use AKS sandbox pods for parallel episode collection:
 ```bash
-python train_distributed.py --episodes 10000 --batch 50 --parallel 50
+# Prerequisites: AKS cluster + agent-sandbox controller
+./sandbox/deploy.sh                     # Apply K8s configs
+python collect_distributed.py ...       # Collect data
+./sandbox/deploy.sh --teardown          # Clean up
 ```
 
-Prerequisites:
-1. AKS cluster with agent-sandbox controller
-2. `kubectl apply -f ../sandbox-arena/sandbox/sandbox-template.yaml`
-3. `kubectl apply -f ../sandbox-arena/sandbox/warm-pool.yaml`
-4. `pip install k8s-agent-sandbox`
+## Adding a New Environment
 
-## Config
-
-Hyperparameters live in `configs/default.yaml`. CLI args override config values.
-
-## Code Structure
-
-- `model/transformer.py` — TradingTransformer architecture (899K params)
-- `model/policy.py` — Inference helpers, checkpoint save/load
-- `envs/features.py` — 52-dim feature engineering (per-commodity + cross-commodity + portfolio)
-- `envs/commodities.py` — CommodityTradingEnv with Sharpe-based reward shaping
-- `train.py` — 3-phase local training (collect → SFT → RL)
-- `train_distributed.py` — Distributed RL via AKS sandbox pods
+1. Write a self-contained episode script (see `SNAKE_EPISODE_SCRIPT` in collect_distributed.py)
+2. Add it to `collect_distributed.py` (local + distributed paths)
+3. If it needs native deps, add them to `sandbox/Dockerfile` and rebuild the image
+4. Test locally first: `--local`, then on AKS

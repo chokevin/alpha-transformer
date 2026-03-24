@@ -1,50 +1,19 @@
 # alpha-transformer
 
-Distributed data collection + Decision Transformer / LeWM world models for sequential decision-making. Collects trajectories at scale on AKS sandbox pods, trains models on a single GPU.
+**Distributed data collection for [LeWM](https://github.com/lucas-maes/le-wm) world models using Kubernetes [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) pods.**
 
-**What this repo adds over the official [le-wm](https://github.com/lucas-maes/le-wm):**
-- **Distributed data collection** via [sandbox-arena](https://github.com/chokevin/sandbox-arena) AKS pods (50+ parallel collectors)
-- **HDF5 dataset generation** compatible with `stable-worldmodel` format
-- **Multiple environments** (Snake, commodities) with self-contained episode scripts
-- **Decision Transformer** comparison baseline
+The official LeWM repo trains world models from pre-collected datasets. This repo solves the step before that: **collecting large-scale trajectory datasets in parallel across AKS pods**, outputting HDF5 files that plug directly into the LeWM/[stable-worldmodel](https://github.com/galilai-group/stable-worldmodel) training pipeline.
 
-## Results
+## Why this exists
 
-### Snake (Decision Transformer)
+LeWM's key claim is "15M params, single GPU, few hours." The model training is already fast. The bottleneck is **data collection** — especially for pixel-based environments like Push-T where rendering takes ~0.3-0.7s per step.
 
-| Model | Avg Score | Max | vs Random |
-|-------|----------|-----|-----------|
-| Random | 0.2 | 1 | baseline |
-| **Decision Transformer (SFT)** | **7.5** | **12** | **+7.3 (50×)** |
-| Greedy Heuristic | 19.6 | 29 | ceiling |
+| | Local | 50 AKS Pods |
+|---|---|---|
+| Push-T (96×96 pixels) | 1.5 eps/s | **~75 eps/s** |
+| 5000 episodes | ~55 min | **~1 min** |
 
-92.9% action prediction accuracy after 50 epochs SFT. The transformer learns to navigate toward food, avoid walls, and manage its growing body from demonstration data alone.
-
-### Commodities (experimental)
-
-| Model | Avg Return | Win Rate | Sharpe |
-|-------|-----------|----------|--------|
-| Buy & Hold | +1.9% | — | baseline |
-| Decision Transformer (SFT) | +0.8% | 60% | +0.30 |
-
-Commodity trading has noisy rewards which cause RL action collapse. SFT-only works but needs more data.
-
-## Architecture
-
-```
-┌────────────────────────────────┐      ┌──────────────────────────────┐
-│  alpha-transformer (this repo) │      │  sandbox-arena (environment) │
-│                                │      │                              │
-│  Decision Transformer          │ ───> │  Commodity trading env       │
-│  899K params, 4 layers         │ acts │  Gold, Oil, Wheat, NatGas    │
-│  128 hidden, 52-dim state      │      │  Realistic price dynamics    │
-│                                │      │  Technical indicators        │
-│  Phase 1: Collect trajectories │ <─── │  Cross-commodity features    │
-│  Phase 2: SFT on top 20%      │ rwds │  Transaction costs           │
-│  Phase 3: RL fine-tuning       │      │                              │
-│  (PPO-style + entropy bonus)   │      │  Distributed via AKS pods   │
-└────────────────────────────────┘      └──────────────────────────────┘
-```
+This repo dispatches self-contained episode scripts to isolated [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) pods, collects trajectories as JSON, and saves HDF5 datasets compatible with `stable-worldmodel.data.HDF5Dataset`.
 
 ## Quick Start
 
@@ -53,145 +22,119 @@ Commodity trading has noisy rewards which cause RL action collapse. SFT-only wor
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Collect data locally
-python collect_distributed.py --env snake --episodes 5000 --local
+# Collect Push-T data locally (1.5 eps/s)
+python collect_distributed.py --env pusht --episodes 500 --local --format hdf5
 
-# Collect data on AKS (50 parallel pods, ~10x faster)
-./sandbox/deploy.sh  # one-time setup
-python collect_distributed.py --env snake --episodes 10000 --batch 50 --parallel 50
+# Collect on AKS (50x faster for pixel environments)
+./sandbox/deploy.sh
+python collect_distributed.py --env pusht --episodes 5000 --batch 15 --parallel 15 --format hdf5
 
-# Train Decision Transformer on Snake
-python train_snake.py --phase all
-
-# Train LeWM world model on Snake
-python train_lewm_snake.py --phase all
-
-# Full pipeline: collect → SFT → RL → evaluate
-python train.py --phase all
-
-# Just RL fine-tuning (after SFT)
-python train.py --phase rl --rl-episodes 5000
-
-# Distributed RL on AKS (50 parallel sandbox pods)
-python train_distributed.py --episodes 5000 --batch 50 --parallel 50
-
-# Evaluate against baselines
-python evaluate.py
-
-# Visualize results
-python visualize.py
+# Output plugs directly into stable-worldmodel
+python -c "
+from stable_worldmodel.data import HDF5Dataset
+ds = HDF5Dataset('pusht_5000', num_steps=16, cache_dir='results')
+print(f'{len(ds)} training samples ready')
+"
 ```
 
-## Training Pipeline
+## Architecture
 
-### Phase 1: Collect Trajectories
-Gather episodes from diverse heuristic policies (Bollinger reversion, momentum, risk-parity). Filter for top 20% by return to train only on profitable patterns.
+```
+┌──────────────────────────────┐
+│  collect_distributed.py      │
+│  (local or AKS pods)         │
+│                              │     ┌───────────────┐
+│  Dispatches episode scripts  │────▶│ AKS Pod 1     │──▶ trajectory
+│  to sandbox pods in parallel │     │ AKS Pod 2     │──▶ trajectory
+│                              │     │ ...           │
+│  Collects JSON trajectories  │◀────│ AKS Pod N     │──▶ trajectory
+│  Saves HDF5 (stable-wm fmt) │     └───────────────┘
+└──────────┬───────────────────┘
+           │ results/pusht_5000.h5
+           ▼
+┌──────────────────────────────┐     ┌───────────────┐
+│  le-wm / stable-worldmodel   │     │ Single GPU    │
+│  train.py                    │────▶│ LeWM training │
+│  eval.py                     │     │ CEM planning  │
+└──────────────────────────────┘     └───────────────┘
+```
 
-### Phase 2: Supervised Fine-Tuning (SFT)
-Train the transformer to predict actions from (state, return-to-go) sequences. Uses warmup + cosine LR decay. The model learns to imitate profitable trading patterns.
+## Supported Environments
 
-### Phase 3: RL Fine-Tuning
-PPO-style clipped policy gradient against the live commodity environment with entropy bonus for exploration. Saves best model by Sharpe ratio.
+| Environment | Obs | Actions | Local Speed | AKS Speedup | Sandbox Deps |
+|---|---|---|---|---|---|
+| **Push-T** | 96×96 pixels + agent_pos | 2D continuous | 1.5 eps/s | ~50× | Custom image (gym-pusht, pymunk) |
+| **Snake** | 300-dim grid | Discrete(4) | 34 eps/s | N/A (already fast) | None (pure Python) |
 
-## Model
+## HDF5 Output Format
 
-Causal transformer that treats trading as sequence modeling:
+Compatible with [`stable_worldmodel.data.HDF5Dataset`](https://github.com/galilai-group/stable-worldmodel):
 
-| Component | Details |
-|-----------|---------|
-| Architecture | Causal transformer encoder (pre-norm) |
-| Parameters | 899K |
-| Layers | 4 |
-| Heads | 4 |
-| Hidden dim | 128 |
-| Sequence length | 60 timesteps |
-| Input | Interleaved (return-to-go, state, action) tokens |
-| Output | Position sizes for 4 commodities (continuous [-1, 1]) |
+```
+ep_len:     (n_episodes,) int64     — length of each episode
+ep_offset:  (n_episodes,) int64     — cumulative row offset
+pixels:     (N, 96, 96, 3) uint8    — pixel observations (if applicable)
+agent_pos:  (N, 2) float32          — agent position
+action:     (N, 2) float32          — actions taken
+reward:     (N,) float32            — rewards
+step_idx:   (N,) int32              — timestep within episode
+ep_idx:     (N,) int32              — episode index
+```
 
-## Features (52-dimensional state)
+## AKS Deployment
 
-| Feature Group | Count | Details |
-|---------------|-------|---------|
-| Per-commodity | 10 × 4 = 40 | Returns (1/5/20d), MA ratios, realized vol, vol regime, RSI, Bollinger, momentum divergence |
-| Cross-commodity | 6 | Pairwise rolling correlations |
-| Portfolio state | 6 | Cash %, return, drawdown, time remaining, concentration (HHI), turnover |
-
-## Reward Shaping
-
-- **Sharpe contribution**: daily return / rolling volatility
-- **Drawdown penalty**: penalize distance from peak
-- **Concentration penalty**: Herfindahl index of position weights
-- **Turnover penalty**: transaction cost awareness
-- **Terminal bonus**: episode Sharpe ratio − max drawdown
-
-## Config
-
-All hyperparameters are in `configs/default.yaml` and loaded automatically. CLI args override config values:
+Requires an AKS cluster with [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) controller installed.
 
 ```bash
-python train.py --hidden 256 --layers 6  # override model size
+# 1. Install agent-sandbox controller (one-time)
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.2.1/manifest.yaml
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.2.1/extensions.yaml
+
+# 2. Deploy sandbox template + warm pool + router
+./sandbox/deploy.sh
+
+# 3. For Push-T: build custom image with deps (one-time)
+az acr build --registry <your-acr> --image alpha-sandbox:latest sandbox/
+
+# 4. Collect
+python collect_distributed.py --env pusht --episodes 5000 \
+    --batch 15 --parallel 15 --format hdf5
+
+# 5. Clean up when done
+./sandbox/deploy.sh --teardown
 ```
 
 ## Project Structure
 
 ```
 alpha-transformer/
+├── collect_distributed.py     # Core: distributed data collection
+├── sandbox/
+│   ├── Dockerfile             # Custom sandbox image (Push-T deps)
+│   ├── sandbox-template.yaml  # K8s SandboxTemplate
+│   ├── warm-pool.yaml         # Pre-warmed pods
+│   └── deploy.sh              # One-command AKS setup
+├── train_lewm_pusht.py        # LeWM training for Push-T
+├── train_lewm_snake.py        # LeWM training for Snake
+├── train_snake.py             # Decision Transformer baseline
 ├── model/
-│   ├── transformer.py      # Decision Transformer architecture
-│   └── policy.py           # Action selection, inference, checkpointing
+│   ├── encoder.py             # LeWM encoder
+│   ├── predictor.py           # LeWM predictor (AdaLN transformer)
+│   ├── sigreg.py              # SIGReg anti-collapse regularizer
+│   └── transformer.py         # Decision Transformer (comparison)
 ├── envs/
-│   ├── commodities.py      # Commodity trading Gym env
-│   └── features.py         # Technical + cross-commodity feature engineering
-├── configs/
-│   └── default.yaml        # Hyperparameters
-├── train.py                # 3-phase training pipeline (local)
-├── train_distributed.py    # Distributed RL via AKS sandbox pods
-├── evaluate.py             # Evaluation against baselines
-├── visualize.py            # Training curves + portfolio charts
-├── requirements.txt
-└── results/                # Saved models + training logs
+│   ├── snake.py               # Snake Gym environment
+│   └── commodities.py         # Commodity trading Gym environment
+├── planner.py                 # CEM planner
+└── results/                   # Saved models + HDF5 datasets
 ```
 
-## Distributed Training on AKS
+## Relationship to Other Repos
 
-For large-scale RL, use sandbox-arena's AKS infrastructure:
-
-```bash
-# Prerequisites: AKS cluster with agent-sandbox controller
-cd ../sandbox-arena
-kubectl apply -f sandbox/sandbox-template.yaml
-kubectl apply -f sandbox/warm-pool.yaml
-
-# Run distributed training (50 parallel pods, ~10x faster)
-cd ../alpha-transformer
-python train_distributed.py --episodes 5000 --batch 50 --parallel 50
-```
-
-Each episode runs in an isolated sandbox pod. The trainer dispatches batches via `k8s-agent-sandbox`, collects trajectories, and updates the model locally.
-
-## Results
-
-| Model | Avg Return | Std | Win Rate | Sharpe | Alpha vs B&H |
-|-------|-----------|-----|----------|--------|--------------|
-| Buy & Hold | +1.9% | 9.3% | — | — | baseline |
-| **Decision Transformer (SFT)** | **+0.8%** | **2.7%** | **60%** | **+0.30** | **-1.1%** |
-| Target | >5% | <10% | >55% | >0.5 | positive |
-
-**Key insight**: SFT-only outperforms SFT+RL. Policy gradient RL consistently collapses actions toward zero in this environment. See improvement roadmap below.
-
-## Improvement Roadmap
-
-1. **More data** — Collect 5K+ trajectories via AKS parallelism, filter top 20%
-2. **DAgger** — Run model, identify failure states, collect expert demos, retrain SFT
-3. **Offline RL** — Conservative Q-Learning (CQL) avoids the action collapse problem
-4. **Smaller model** — Try 200K params with 5x more data (reduce overfitting)
-5. **Real data** — Replace synthetic prices with historical commodity data
-
-## Relationship to sandbox-arena
-
-This repo is the **model**. [sandbox-arena](https://github.com/chokevin/sandbox-arena) is the **environment/platform**.
-
-- sandbox-arena provides the `CommodityTradingEnv` Gym environment
-- sandbox-arena handles distributed episode collection across AKS pods
-- This repo handles model architecture, training, and evaluation
-- Clone both side-by-side: `~/dev/alpha-transformer/` and `~/dev/sandbox-arena/`
+| Repo | Role | What it provides |
+|---|---|---|
+| [le-wm](https://github.com/lucas-maes/le-wm) | Model | LeWM architecture + training scripts |
+| [stable-worldmodel](https://github.com/galilai-group/stable-worldmodel) | Framework | HDF5Dataset, CEM/MPPI solvers, environments, eval |
+| [stable-pretraining](https://github.com/galilai-group/stable-pretraining) | Framework | ViT backbone, Lightning training, monitoring callbacks |
+| [sandbox-arena](https://github.com/chokevin/sandbox-arena) | Platform | Additional Gym environments, deployment scripts |
+| **alpha-transformer (this repo)** | **Data pipeline** | **Distributed collection → HDF5 → feeds into all of the above** |

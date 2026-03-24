@@ -399,13 +399,18 @@ def save_hdf5(trajectories, output_path, obs_key="pixels"):
     """Save trajectories as HDF5 dataset.
 
     Format compatible with stable-worldmodel's HDF5Dataset:
-      - pixels: (N, obs_dim) or (N, C, H, W) observations
+      - ep_len: (n_episodes,) length of each episode
+      - ep_offset: (n_episodes,) cumulative offset for each episode
+      - pixels: (N, H, W, C) or state obs
       - action: (N, action_dim) actions
-      - reward: (N,) rewards
-      - episode_idx: (N,) which episode each row belongs to
       - step_idx: (N,) timestep within episode
+      - episode_idx: (N,) which episode
     """
-    # Flatten all trajectories into rows
+    # Compute episode lengths and offsets for stable-worldmodel compatibility
+    ep_lens = []
+    ep_offsets = []
+    offset = 0
+
     all_obs, all_actions, all_rewards = [], [], []
     all_episode_idx, all_step_idx = [], []
     all_pixels = []
@@ -416,6 +421,10 @@ def save_hdf5(trajectories, output_path, obs_key="pixels"):
         actions = np.array(traj["actions"])
         rewards = np.array(traj["rewards"], dtype=np.float32)
         T = len(states)
+
+        ep_lens.append(T)
+        ep_offsets.append(offset)
+        offset += T
 
         all_obs.append(states)
         all_actions.append(actions)
@@ -432,28 +441,33 @@ def save_hdf5(trajectories, output_path, obs_key="pixels"):
     episode_idx = np.concatenate(all_episode_idx, axis=0)
     step_idx = np.concatenate(all_step_idx, axis=0)
 
-    # Handle action shape
     if actions.ndim == 1:
-        actions = actions.reshape(-1, 1)  # (N, 1) for discrete
+        actions = actions.reshape(-1, 1)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(output_path, "w") as f:
+        # stable-worldmodel required fields
+        f.create_dataset("ep_len", data=np.array(ep_lens, dtype=np.int64))
+        f.create_dataset("ep_offset", data=np.array(ep_offsets, dtype=np.int64))
+        f.create_dataset("step_idx", data=step_idx)
+        f.create_dataset("ep_idx", data=episode_idx)
+
         if has_pixels and all_pixels:
             pixels = np.concatenate(all_pixels, axis=0)
             f.create_dataset("pixels", data=pixels, compression="gzip", compression_opts=4)
             f.create_dataset("agent_pos", data=obs, compression="gzip", compression_opts=4)
         else:
             f.create_dataset(obs_key, data=obs, compression="gzip", compression_opts=4)
+
         f.create_dataset("action", data=actions.astype(np.float32), compression="gzip")
         f.create_dataset("reward", data=rewards, compression="gzip")
-        f.create_dataset("episode_idx", data=episode_idx, compression="gzip")
-        f.create_dataset("step_idx", data=step_idx, compression="gzip")
 
     n_episodes = len(trajectories)
     n_rows = len(obs)
     size_mb = Path(output_path).stat().st_size / 1024 / 1024
     print(f"  Saved: {output_path}")
     print(f"  {n_episodes} episodes, {n_rows} rows, {size_mb:.1f} MB")
+    print(f"  Format: stable-worldmodel HDF5 (ep_len + ep_offset)")
 
 
 def save_json(trajectories, output_path):

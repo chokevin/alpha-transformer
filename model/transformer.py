@@ -79,7 +79,7 @@ class TradingTransformer(nn.Module):
         )
 
         # Learnable log-std for exploration (RL phase)
-        self.log_std = nn.Parameter(torch.full((action_dim,), -0.5))
+        self.log_std = nn.Parameter(torch.full((action_dim,), 0.0))  # start with std≈1.0 for exploration
 
         self._init_weights()
 

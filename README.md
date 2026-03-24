@@ -131,6 +131,24 @@ python train_distributed.py --episodes 5000 --batch 50 --parallel 50
 
 Each episode runs in an isolated sandbox pod. The trainer dispatches batches via `k8s-agent-sandbox`, collects trajectories, and updates the model locally.
 
+## Results
+
+| Model | Avg Return | Std | Win Rate | Sharpe | Alpha vs B&H |
+|-------|-----------|-----|----------|--------|--------------|
+| Buy & Hold | +1.9% | 9.3% | — | — | baseline |
+| **Decision Transformer (SFT)** | **+0.8%** | **2.7%** | **60%** | **+0.30** | **-1.1%** |
+| Target | >5% | <10% | >55% | >0.5 | positive |
+
+**Key insight**: SFT-only outperforms SFT+RL. Policy gradient RL consistently collapses actions toward zero in this environment. See improvement roadmap below.
+
+## Improvement Roadmap
+
+1. **More data** — Collect 5K+ trajectories via AKS parallelism, filter top 20%
+2. **DAgger** — Run model, identify failure states, collect expert demos, retrain SFT
+3. **Offline RL** — Conservative Q-Learning (CQL) avoids the action collapse problem
+4. **Smaller model** — Try 200K params with 5x more data (reduce overfitting)
+5. **Real data** — Replace synthetic prices with historical commodity data
+
 ## Relationship to sandbox-arena
 
 This repo is the **model**. [sandbox-arena](https://github.com/chokevin/sandbox-arena) is the **environment/platform**.

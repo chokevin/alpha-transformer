@@ -195,30 +195,16 @@ class CommodityTradingEnv(gym.Env):
         self.daily_returns.append(daily_return)
 
         # --- Reward shaping ---
-        # 1) Sharpe contribution: risk-adjusted daily return
-        if len(self.daily_returns) > 5:
-            recent_std = np.std(self.daily_returns[-20:]) + 1e-8
-            sharpe_contribution = daily_return / recent_std
-        else:
-            sharpe_contribution = daily_return * 100
+        # 1) Scaled daily return (primary signal)
+        reward = daily_return * 100
 
-        # 2) Drawdown penalty
+        # 2) Drawdown penalty (moderate — don't overwhelm return signal)
         drawdown = (self.peak_value - pv_after) / self.peak_value
-        drawdown_penalty = drawdown * 5
+        reward -= drawdown * 3
 
-        # 3) Concentration penalty (prefer diversified positions)
-        weights = []
-        for name in self.commodity_names:
-            w = abs(self.positions[name] * self.prices[name][self.day]) / pv_after if pv_after > 0 else 0
-            weights.append(w)
-        hhi = sum(w ** 2 for w in weights)
-        concentration_penalty = hhi * 2  # penalize concentrated bets
-
-        # 4) Turnover penalty (penalize excessive trading)
+        # 3) Mild turnover penalty (only penalize excessive churn)
         turnover = total_cost / pv_before if pv_before > 0 else 0
-        turnover_penalty = turnover * 50
-
-        reward = sharpe_contribution - drawdown_penalty - concentration_penalty - turnover_penalty
+        reward -= turnover * 20
 
         info = {
             "portfolio_value": round(pv_after, 2),
@@ -244,7 +230,7 @@ class CommodityTradingEnv(gym.Env):
             info["max_drawdown"] = round(max_dd * 100, 2)
             info["final_value"] = round(pv_after, 2)
 
-            # Terminal bonus: reward Sharpe, penalize max drawdown
-            reward += sharpe * 15 - max_dd * 10
+            # Terminal bonus: strong Sharpe signal
+            reward += sharpe * 20 - max_dd * 5
 
         return self._get_obs(), reward, done, False, info

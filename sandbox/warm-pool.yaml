@@ -4,6 +4,6 @@ metadata:
   name: alpha-transformer-pool
   namespace: default
 spec:
-  templateRef:
+  sandboxTemplateRef:
     name: alpha-transformer-sandbox
   replicas: 20

@@ -1,8 +1,31 @@
 # alpha-transformer
 
-Decision Transformer for multi-commodity trading. Trains a causal transformer to trade Gold, Oil, Wheat, and Natural Gas using the pretrain → SFT → RL pipeline.
+Decision Transformer for sequential decision-making. Trains causal transformers via supervised learning on expert trajectories, conditioned on desired returns.
 
-Uses [sandbox-arena](https://github.com/chokevin/sandbox-arena) as the RL environment and supports distributed training on AKS.
+**Supported environments** (via [sandbox-arena](https://github.com/chokevin/sandbox-arena)):
+- **Snake** — 10×10 grid game, discrete actions, dense reward (**primary, proven domain**)
+- **Commodities** — Multi-asset trading, continuous actions (experimental)
+
+## Results
+
+### Snake (Decision Transformer)
+
+| Model | Avg Score | Max | vs Random |
+|-------|----------|-----|-----------|
+| Random | 0.2 | 1 | baseline |
+| **Decision Transformer (SFT)** | **7.5** | **12** | **+7.3 (50×)** |
+| Greedy Heuristic | 19.6 | 29 | ceiling |
+
+92.9% action prediction accuracy after 50 epochs SFT. The transformer learns to navigate toward food, avoid walls, and manage its growing body from demonstration data alone.
+
+### Commodities (experimental)
+
+| Model | Avg Return | Win Rate | Sharpe |
+|-------|-----------|----------|--------|
+| Buy & Hold | +1.9% | — | baseline |
+| Decision Transformer (SFT) | +0.8% | 60% | +0.30 |
+
+Commodity trading has noisy rewards which cause RL action collapse. SFT-only works but needs more data.
 
 ## Architecture
 

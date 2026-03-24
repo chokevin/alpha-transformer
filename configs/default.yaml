@@ -1,0 +1,28 @@
+# Default training configuration
+model:
+  hidden_dim: 64
+  n_heads: 4
+  n_layers: 3
+  max_seq_len: 60
+  dropout: 0.1
+
+collect:
+  episodes: 500
+  min_return_percentile: 50  # only keep top 50% trajectories for SFT
+
+sft:
+  epochs: 50
+  lr: 0.0001
+  batch_size: 32
+
+rl:
+  episodes: 2000
+  batch_size: 10
+  lr: 0.00005
+  target_return: 20.0  # condition on 20% desired return
+  eval_interval: 200
+
+environment:
+  n_days: 252
+  initial_cash: 100000
+  commission_bps: 2

@@ -188,6 +188,9 @@ print(json.dumps({{
 '''
 
 PUSHT_EPISODE_SCRIPT = '''
+import subprocess, sys
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "gym-pusht", "pymunk<7"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 import json
 import numpy as np
 
@@ -365,7 +368,8 @@ def collect_distributed(env_name, n_episodes, batch_size, parallel,
             try:
                 with SandboxClient(template_name=template, namespace=namespace) as sandbox:
                     sandbox.write("episode.py", script.encode())
-                    result = sandbox.run("python3 episode.py", timeout=120)
+                    timeout = 300 if env_name == "pusht" else 120
+                    result = sandbox.run("python3 episode.py", timeout=timeout)
                 if result.exit_code == 0:
                     return json.loads(result.stdout.strip().split("\n")[-1])
                 else:

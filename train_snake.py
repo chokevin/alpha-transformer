@@ -227,11 +227,118 @@ def _greedy_snake(obs, grid_size=10):
     return best_a
 
 
-def _noisy_greedy(obs, grid_size=10, noise=0.2):
-    """Greedy with random exploration."""
-    if np.random.random() < noise:
+def _flood_fill_count(start, blocked, grid_size):
+    """Count reachable cells from start, avoiding blocked cells."""
+    visited = set()
+    stack = [start]
+    while stack:
+        r, c = stack.pop()
+        if (r, c) in visited or (r, c) in blocked:
+            continue
+        if r < 0 or r >= grid_size or c < 0 or c >= grid_size:
+            continue
+        visited.add((r, c))
+        stack.extend([(r-1, c), (r+1, c), (r, c-1), (r, c+1)])
+    return len(visited)
+
+
+def _bfs_path(start, goal, blocked, grid_size):
+    """BFS shortest path from start to goal avoiding blocked cells."""
+    from collections import deque
+    queue = deque([(start, [])])
+    visited = {start}
+    moves = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+
+    while queue:
+        (r, c), path = queue.popleft()
+        if (r, c) == goal:
+            return path
+        for a, (dr, dc) in enumerate(moves):
+            nr, nc = r + dr, c + dc
+            if (0 <= nr < grid_size and 0 <= nc < grid_size and
+                    (nr, nc) not in visited and (nr, nc) not in blocked):
+                visited.add((nr, nc))
+                queue.append(((nr, nc), path + [a]))
+    return None
+
+
+def _smart_snake(obs, grid_size=10):
+    """BFS pathfinding to food with self-trap avoidance.
+
+    1. Find BFS path to food
+    2. Check if taking that step leaves enough reachable space
+    3. If trapped, pick the move that maximizes reachable area
+    """
+    grid = obs.reshape(grid_size, grid_size, 3)
+    head_pos = np.argwhere(grid[:, :, 1] == 1.0)
+    food_pos = np.argwhere(grid[:, :, 2] == 1.0)
+
+    if len(head_pos) == 0 or len(food_pos) == 0:
         return np.random.randint(4)
-    return _greedy_snake(obs, grid_size)
+
+    hr, hc = int(head_pos[0][0]), int(head_pos[0][1])
+    fr, fc = int(food_pos[0][0]), int(food_pos[0][1])
+    body = set(map(tuple, np.argwhere(grid[:, :, 0] == 1.0)))
+    snake_len = len(body)
+
+    moves = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+
+    # Find safe moves
+    safe_moves = []
+    for a, (dr, dc) in enumerate(moves):
+        nr, nc = hr + dr, hc + dc
+        if 0 <= nr < grid_size and 0 <= nc < grid_size and (nr, nc) not in body:
+            safe_moves.append(a)
+
+    if not safe_moves:
+        return np.random.randint(4)
+    if len(safe_moves) == 1:
+        return safe_moves[0]
+
+    # Try BFS to food
+    path = _bfs_path((hr, hc), (fr, fc), body, grid_size)
+    if path:
+        first_action = path[0]
+        # Check if this move is safe (doesn't trap us)
+        dr, dc = moves[first_action]
+        nr, nc = hr + dr, hc + dc
+        new_body = body | {(nr, nc)}
+        reachable = _flood_fill_count((nr, nc), new_body - {(nr, nc)}, grid_size)
+        if reachable >= snake_len:
+            return first_action
+
+    # Fallback: pick move that maximizes reachable area
+    best_a = safe_moves[0]
+    best_reach = -1
+    for a in safe_moves:
+        dr, dc = moves[a]
+        nr, nc = hr + dr, hc + dc
+        new_body = body | {(nr, nc)}
+        reachable = _flood_fill_count((nr, nc), new_body - {(nr, nc)}, grid_size)
+        if reachable > best_reach:
+            best_reach = reachable
+            best_a = a
+
+    return best_a
+
+
+def _noisy_smart(obs, grid_size=10, noise=0.1):
+    """Smart heuristic with small exploration noise."""
+    if np.random.random() < noise:
+        # Even random moves should be safe when possible
+        grid = obs.reshape(grid_size, grid_size, 3)
+        head_pos = np.argwhere(grid[:, :, 1] == 1.0)
+        if len(head_pos) > 0:
+            hr, hc = head_pos[0]
+            body = set(map(tuple, np.argwhere(grid[:, :, 0] == 1.0)))
+            moves = [(-1, 0), (0, 1), (1, 0), (0, -1)]
+            safe = [a for a, (dr, dc) in enumerate(moves)
+                    if 0 <= hr+dr < grid_size and 0 <= hc+dc < grid_size
+                    and (hr+dr, hc+dc) not in body]
+            if safe:
+                return np.random.choice(safe)
+        return np.random.randint(4)
+    return _smart_snake(obs, grid_size)
 
 
 # ============================================================
@@ -239,7 +346,7 @@ def _noisy_greedy(obs, grid_size=10, noise=0.2):
 # ============================================================
 
 def collect_trajectories(n_episodes, grid_size=10, min_score_percentile=50):
-    """Collect trajectories using greedy + noisy heuristics."""
+    """Collect trajectories using BFS-based smart heuristic."""
     trajectories = []
 
     for ep in range(n_episodes):
@@ -247,13 +354,13 @@ def collect_trajectories(n_episodes, grid_size=10, min_score_percentile=50):
         obs, _ = env.reset()
         states, actions, rewards = [], [], []
 
-        # Vary exploration noise
-        noise = np.random.uniform(0.05, 0.3)
+        # Vary exploration: mostly smart, some noisier for diversity
+        noise = np.random.choice([0.02, 0.05, 0.1, 0.15], p=[0.3, 0.3, 0.25, 0.15])
         done = False
         while not done:
             states.append(obs.tolist())
-            action = _noisy_greedy(obs, grid_size, noise)
-            actions.append(action)
+            action = _noisy_smart(obs, grid_size, noise)
+            actions.append(int(action))
             obs, reward, terminated, truncated, info = env.step(action)
             rewards.append(reward)
             done = terminated or truncated
@@ -428,6 +535,19 @@ def run_baselines(n_episodes=100, grid_size=10):
             done = t or tr
         greedy_scores.append(info.get("score", 0))
     results["Greedy"] = greedy_scores
+
+    # Smart BFS heuristic
+    smart_scores = []
+    for _ in range(n_episodes):
+        env = SnakeEnv(grid_size=grid_size)
+        obs, _ = env.reset()
+        done = False
+        while not done:
+            action = _smart_snake(obs, grid_size)
+            obs, _, t, tr, info = env.step(action)
+            done = t or tr
+        smart_scores.append(info.get("score", 0))
+    results["Smart BFS"] = smart_scores
 
     return results
 

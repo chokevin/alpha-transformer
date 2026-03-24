@@ -187,10 +187,53 @@ print(json.dumps({{
 }}))
 '''
 
+PUSHT_EPISODE_SCRIPT = '''
+import json
+import numpy as np
 
-# ============================================================
-# Local collection (no AKS)
-# ============================================================
+SEED = {seed}
+MAX_STEPS = {max_steps}
+
+# Push-T requires gym-pusht and pymunk<7
+import gymnasium as gym
+import gym_pusht
+
+rng = np.random.default_rng(SEED)
+env = gym.make('gym_pusht/PushT-v0', obs_type='pixels_agent_pos', render_mode='rgb_array')
+obs, info = env.reset(seed=SEED)
+
+states, actions, rewards, pixels = [], [], [], []
+done = False
+steps = 0
+while not done and steps < MAX_STEPS:
+    # obs is dict: {{"pixels": (96,96,3), "agent_pos": (2,)}}
+    pix = obs["pixels"]  # uint8 (96, 96, 3)
+    agent_pos = obs["agent_pos"]  # float (2,)
+
+    # Store flattened pixel + agent_pos as state
+    pixels.append(pix.tolist())
+    states.append(agent_pos.tolist())
+
+    # Random policy (we just need diverse data covering the space)
+    # Biased toward the center to push the T-block
+    center = np.array([256.0, 256.0])
+    action = center + rng.normal(0, 80, size=2)
+    action = np.clip(action, 0, 512).astype(np.float32)
+
+    actions.append(action.tolist())
+    obs, reward, terminated, truncated, info = env.step(action)
+    rewards.append(float(reward))
+    done = terminated or truncated
+    steps += 1
+
+print(json.dumps({{
+    "pixels": pixels, "states": states, "actions": actions,
+    "rewards": rewards, "length": len(states),
+    "coverage": float(info.get("coverage", 0)),
+}}))
+'''
+
+
 
 def collect_local(env_name, n_episodes, grid_size=10):
     """Collect trajectories locally using Python multiprocessing."""
@@ -241,6 +284,46 @@ def collect_local(env_name, n_episodes, grid_size=10):
                 print(f"  [{ep+1}/{n_episodes}] avg={np.mean(scores):.1f} max={max(scores)}")
 
         return trajectories
+    elif env_name == "pusht":
+        import gymnasium as gym
+        import gym_pusht
+
+        trajectories = []
+        for ep in range(n_episodes):
+            env = gym.make('gym_pusht/PushT-v0', obs_type='pixels_agent_pos',
+                           render_mode='rgb_array')
+            obs, info = env.reset(seed=ep)
+            states, actions, rewards, pixels = [], [], [], []
+            done = False
+            steps = 0
+            while not done and steps < 300:
+                pix = obs["pixels"]
+                agent_pos = obs["agent_pos"]
+                pixels.append(pix.tolist())
+                states.append(agent_pos.tolist())
+
+                center = np.array([256.0, 256.0])
+                action = center + np.random.normal(0, 80, size=2)
+                action = np.clip(action, 0, 512).astype(np.float32)
+
+                actions.append(action.tolist())
+                obs, reward, terminated, truncated, info = env.step(action)
+                rewards.append(float(reward))
+                done = terminated or truncated
+                steps += 1
+
+            trajectories.append({
+                "pixels": pixels, "states": states, "actions": actions,
+                "rewards": rewards, "length": len(states),
+                "coverage": float(info.get("coverage", 0)),
+            })
+
+            if (ep + 1) % 50 == 0:
+                recent = trajectories[-50:]
+                coverages = [t["coverage"] for t in recent]
+                print(f"  [{ep+1}/{n_episodes}] avg_coverage={np.mean(coverages):.3f}")
+
+        return trajectories
     else:
         raise ValueError(f"Unknown env: {env_name}. Supported: snake")
 
@@ -256,6 +339,8 @@ def collect_distributed(env_name, n_episodes, batch_size, parallel,
 
     if env_name == "snake":
         script_template = SNAKE_EPISODE_SCRIPT
+    elif env_name == "pusht":
+        script_template = PUSHT_EPISODE_SCRIPT
     else:
         raise ValueError(f"Unknown env: {env_name}")
 
@@ -271,7 +356,12 @@ def collect_distributed(env_name, n_episodes, batch_size, parallel,
         print(f"  Batch {batch_idx+1}/{n_batches}: dispatching {current_batch} episodes to {parallel} pods...")
 
         def run_one(seed):
-            script = script_template.format(seed=seed, grid_size=grid_size)
+            if env_name == "snake":
+                script = script_template.format(seed=seed, grid_size=grid_size)
+            elif env_name == "pusht":
+                script = script_template.format(seed=seed, max_steps=300)
+            else:
+                script = script_template.format(seed=seed)
             try:
                 with SandboxClient(template_name=template, namespace=namespace) as sandbox:
                     sandbox.write("episode.py", script.encode())
@@ -317,6 +407,8 @@ def save_hdf5(trajectories, output_path, obs_key="pixels"):
     # Flatten all trajectories into rows
     all_obs, all_actions, all_rewards = [], [], []
     all_episode_idx, all_step_idx = [], []
+    all_pixels = []
+    has_pixels = "pixels" in trajectories[0]
 
     for ep_idx, traj in enumerate(trajectories):
         states = np.array(traj["states"], dtype=np.float32)
@@ -330,6 +422,9 @@ def save_hdf5(trajectories, output_path, obs_key="pixels"):
         all_episode_idx.append(np.full(T, ep_idx, dtype=np.int32))
         all_step_idx.append(np.arange(T, dtype=np.int32))
 
+        if has_pixels:
+            all_pixels.append(np.array(traj["pixels"], dtype=np.uint8))
+
     obs = np.concatenate(all_obs, axis=0)
     actions = np.concatenate(all_actions, axis=0)
     rewards = np.concatenate(all_rewards, axis=0)
@@ -342,7 +437,12 @@ def save_hdf5(trajectories, output_path, obs_key="pixels"):
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(output_path, "w") as f:
-        f.create_dataset(obs_key, data=obs, compression="gzip", compression_opts=4)
+        if has_pixels and all_pixels:
+            pixels = np.concatenate(all_pixels, axis=0)
+            f.create_dataset("pixels", data=pixels, compression="gzip", compression_opts=4)
+            f.create_dataset("agent_pos", data=obs, compression="gzip", compression_opts=4)
+        else:
+            f.create_dataset(obs_key, data=obs, compression="gzip", compression_opts=4)
         f.create_dataset("action", data=actions.astype(np.float32), compression="gzip")
         f.create_dataset("reward", data=rewards, compression="gzip")
         f.create_dataset("episode_idx", data=episode_idx, compression="gzip")
@@ -372,7 +472,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Distributed data collection for LeWM training"
     )
-    parser.add_argument("--env", default="snake", choices=["snake"],
+    parser.add_argument("--env", default="snake", choices=["snake", "pusht"],
                         help="Environment to collect from")
     parser.add_argument("--episodes", type=int, default=5000)
     parser.add_argument("--grid-size", type=int, default=10)
@@ -410,18 +510,20 @@ def main():
         )
 
     elapsed = time.time() - t0
-    scores = [t.get("score", 0) for t in trajectories]
+    scores = [t.get("score", t.get("coverage", 0)) for t in trajectories]
     print(f"\nCollected {len(trajectories)} trajectories in {elapsed:.1f}s "
           f"({len(trajectories)/elapsed:.0f} eps/s)")
-    print(f"Scores: avg={np.mean(scores):.1f}, p50={np.median(scores):.0f}, "
-          f"p90={np.percentile(scores,90):.0f}, max={max(scores)}")
+    if scores:
+        print(f"Metric: avg={np.mean(scores):.2f}, p50={np.median(scores):.2f}, "
+              f"p90={np.percentile(scores,90):.2f}, max={max(scores):.2f}")
 
     # Filter
-    if args.min_score_percentile > 0:
+    if args.min_score_percentile > 0 and scores:
         threshold = np.percentile(scores, args.min_score_percentile)
         before = len(trajectories)
-        trajectories = [t for t in trajectories if t.get("score", 0) >= threshold]
-        print(f"Filtered: {len(trajectories)}/{before} (threshold={threshold})")
+        key = "score" if "score" in trajectories[0] else "coverage"
+        trajectories = [t for t in trajectories if t.get(key, 0) >= threshold]
+        print(f"Filtered: {len(trajectories)}/{before} (threshold={threshold:.2f})")
 
     # Save
     base = args.output or f"results/{args.env}_data_{len(trajectories)}"

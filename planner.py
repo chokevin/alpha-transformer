@@ -1,138 +1,168 @@
-"""MPC Planner: searches over action sequences using the world model.
+"""MPC Planner using CEM for the LeWM world model.
 
-At each timestep:
-1. Encode current observation → z_now
-2. Sample N random action sequences (horizon H)
-3. Rollout each through the world model
-4. Score each by a cost function (e.g., distance to goal, predicted return)
-5. Execute the first action of the best sequence
-6. Repeat next timestep
+Uses Cross-Entropy Method to search over action sequences in latent space.
+Supports both goal-based planning (Snake: reach food) and return-based
+planning (commodities: maximize returns).
+
+For discrete actions, samples categorical distributions.
+For continuous actions, samples Gaussian distributions.
 """
 
 import torch
 import numpy as np
-from typing import Callable, Optional
 
 
-class MPCPlanner:
-    """Model Predictive Control planner using the world model."""
+class CEMPlanner:
+    """Cross-Entropy Method planner for latent world models.
 
-    def __init__(self, world_model, horizon: int = 10, n_samples: int = 512,
-                 n_iterations: int = 3, top_k: int = 64,
-                 action_dim: int = 4, action_range: float = 1.0):
-        """
-        Args:
-            world_model: trained MarketWorldModel
-            horizon: planning horizon (steps to look ahead)
-            n_samples: number of action sequences to sample
-            n_iterations: CEM iterations (refine around best candidates)
-            top_k: number of top candidates to keep each iteration
-            action_dim: dimension of action space
-            action_range: max absolute action value
-        """
-        self.model = world_model
+    At each step:
+    1. Encode current obs → z
+    2. Sample N action sequences of length H
+    3. Roll out each through predictor in latent space
+    4. Score by cost function
+    5. Keep top-K, refit distribution, repeat
+    6. Execute first action of best sequence
+    """
+
+    def __init__(self, encoder, predictor, horizon: int = 10,
+                 n_samples: int = 512, n_iterations: int = 3, top_k: int = 64,
+                 n_actions: int = 4, discrete: bool = True):
+        self.encoder = encoder
+        self.predictor = predictor
         self.horizon = horizon
         self.n_samples = n_samples
         self.n_iterations = n_iterations
         self.top_k = top_k
-        self.action_dim = action_dim
-        self.action_range = action_range
+        self.n_actions = n_actions
+        self.discrete = discrete
 
-        # Running mean/std for CEM (Cross-Entropy Method)
-        self._mean = None
-        self._std = None
-
-    def plan(self, obs: np.ndarray, cost_fn: Callable) -> np.ndarray:
-        """Plan the best action for the current observation.
+    @torch.no_grad()
+    def plan(self, obs: np.ndarray, goal_obs: np.ndarray = None,
+             cost_fn=None) -> int:
+        """Plan the best action for current observation.
 
         Args:
-            obs: current observation (obs_dim,)
-            cost_fn: function(z_trajectory) → cost (lower is better)
-                     z_trajectory: (N, H+1, embed_dim)
+            obs: current observation
+            goal_obs: goal observation (for goal-based planning)
+            cost_fn: custom cost function(z_trajectory) → costs (N,)
+
         Returns:
-            best_action: (action_dim,)
+            best_action: scalar (discrete) or array (continuous)
         """
-        device = next(self.model.parameters()).device
+        device = next(self.encoder.parameters()).device
         obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
-        # Encode current state
-        with torch.no_grad():
-            z_now = self.model.encode(obs_t).unsqueeze(1)  # (1, 1, D)
+        self.encoder.eval()
+        self.predictor.eval()
 
-        # Initialize CEM distribution
-        mean = self._mean if self._mean is not None else torch.zeros(
-            self.horizon, self.action_dim, device=device)
-        std = self._std if self._std is not None else torch.ones(
-            self.horizon, self.action_dim, device=device) * 0.5
+        z_now = self.encoder(obs_t)  # (1, D)
+
+        # Encode goal if provided
+        z_goal = None
+        if goal_obs is not None:
+            goal_t = torch.tensor(goal_obs, dtype=torch.float32, device=device).unsqueeze(0)
+            z_goal = self.encoder(goal_t)  # (1, D)
+
+        if self.discrete:
+            return self._plan_discrete(z_now, z_goal, cost_fn, device)
+        else:
+            return self._plan_continuous(z_now, z_goal, cost_fn, device)
+
+    def _plan_discrete(self, z_now, z_goal, cost_fn, device):
+        """CEM for discrete action spaces."""
+        H = self.horizon
+        N = self.n_samples
+
+        # Initialize uniform action probabilities
+        probs = torch.ones(H, self.n_actions, device=device) / self.n_actions
 
         best_actions = None
-        best_cost = float('inf')
+        best_cost = float("inf")
 
         for iteration in range(self.n_iterations):
-            # Sample action sequences from current distribution
-            noise = torch.randn(self.n_samples, self.horizon, self.action_dim,
-                               device=device)
-            actions = mean.unsqueeze(0) + std.unsqueeze(0) * noise
-            actions = actions.clamp(-self.action_range, self.action_range)
+            # Sample action sequences from categorical
+            action_seqs = torch.multinomial(
+                probs.unsqueeze(0).expand(N, -1, -1).reshape(N * H, -1),
+                1
+            ).reshape(N, H).squeeze(-1)  # (N, H)
 
-            # Expand z_now for all samples
-            z_init = z_now.expand(self.n_samples, -1, -1)
+            # Rollout in latent space
+            z = z_now.expand(N, -1)  # (N, D)
+            z_traj = [z]
+            for t in range(H):
+                z = self.predictor.predict_step(z, action_seqs[:, t])
+                z_traj.append(z)
+            z_traj = torch.stack(z_traj, dim=1)  # (N, H+1, D)
 
-            # Rollout all candidates through world model
-            with torch.no_grad():
-                z_trajectories = self.model.rollout(z_init, actions)
+            # Compute costs
+            if cost_fn is not None:
+                costs = cost_fn(z_traj)
+            elif z_goal is not None:
+                # Goal-based: minimize distance to goal at end of rollout
+                costs = (z_traj[:, -1] - z_goal).pow(2).sum(dim=-1)
+            else:
+                raise ValueError("Must provide either goal_obs or cost_fn")
 
-            # Score each trajectory
-            costs = cost_fn(z_trajectories)  # (N,)
+            # Select top-K
+            top_idx = costs.argsort()[:self.top_k]
+            top_actions = action_seqs[top_idx]  # (K, H)
 
-            # Select top-k
-            top_indices = costs.argsort()[:self.top_k]
-            top_actions = actions[top_indices]
+            # Update probabilities from top-K empirical distribution
+            for t in range(H):
+                counts = torch.zeros(self.n_actions, device=device)
+                for a in range(self.n_actions):
+                    counts[a] = (top_actions[:, t] == a).float().sum()
+                probs[t] = (counts + 1) / (self.top_k + self.n_actions)  # Laplace smoothing
 
-            # Update CEM distribution
+            # Track best
+            if costs[top_idx[0]] < best_cost:
+                best_cost = costs[top_idx[0]]
+                best_actions = action_seqs[top_idx[0]]
+
+        return best_actions[0].item()
+
+    def _plan_continuous(self, z_now, z_goal, cost_fn, device):
+        """CEM for continuous action spaces."""
+        H = self.horizon
+        N = self.n_samples
+        A = self.n_actions
+
+        mean = torch.zeros(H, A, device=device)
+        std = torch.ones(H, A, device=device) * 0.5
+
+        best_actions = None
+        best_cost = float("inf")
+
+        for iteration in range(self.n_iterations):
+            noise = torch.randn(N, H, A, device=device)
+            actions = (mean.unsqueeze(0) + std.unsqueeze(0) * noise).clamp(-1, 1)
+
+            # Rollout
+            z = z_now.expand(N, -1)
+            z_traj = [z]
+            for t in range(H):
+                z = self.predictor.predict_step(z, actions[:, t])
+                z_traj.append(z)
+            z_traj = torch.stack(z_traj, dim=1)
+
+            if cost_fn is not None:
+                costs = cost_fn(z_traj)
+            elif z_goal is not None:
+                costs = (z_traj[:, -1] - z_goal).pow(2).sum(dim=-1)
+            else:
+                raise ValueError("Must provide either goal_obs or cost_fn")
+
+            top_idx = costs.argsort()[:self.top_k]
+            top_actions = actions[top_idx]
             mean = top_actions.mean(dim=0)
             std = top_actions.std(dim=0).clamp(min=0.05)
 
-            # Track best
-            if costs[top_indices[0]] < best_cost:
-                best_cost = costs[top_indices[0]]
-                best_actions = actions[top_indices[0]]
+            if costs[top_idx[0]] < best_cost:
+                best_cost = costs[top_idx[0]]
+                best_actions = actions[top_idx[0]]
 
-        # Shift mean for next timestep (warm start)
-        self._mean = torch.cat([mean[1:], torch.zeros(1, self.action_dim, device=device)])
-        self._std = torch.cat([std[1:], torch.ones(1, self.action_dim, device=device) * 0.5])
-
-        # Return first action of best sequence
         return best_actions[0].cpu().numpy()
 
     def reset(self):
-        """Reset planner state (call at start of new episode)."""
-        self._mean = None
-        self._std = None
-
-
-def make_return_cost_fn(world_model, target_return: float = 0.2):
-    """Cost function: prefer trajectories whose final latent is far from initial.
-
-    A simple proxy for return: the model should move the portfolio state
-    away from the starting point in a direction consistent with positive returns.
-
-    For a more sophisticated cost, you'd train a small reward predictor
-    on top of the latent space.
-    """
-    def cost_fn(z_trajectories):
-        # z_trajectories: (N, H+1, D)
-        z_start = z_trajectories[:, 0]   # (N, D)
-        z_end = z_trajectories[:, -1]     # (N, D)
-
-        # Cost = negative magnitude of latent change (we want big changes)
-        # Plus variance penalty (we want consistent trajectories)
-        change = (z_end - z_start).pow(2).sum(dim=-1)  # (N,)
-
-        # Also penalize trajectories that are too volatile
-        diffs = torch.diff(z_trajectories, dim=1)  # (N, H, D)
-        volatility = diffs.pow(2).sum(dim=-1).mean(dim=-1)  # (N,)
-
-        return -change + 0.1 * volatility  # lower is better
-
-    return cost_fn
+        """Reset planner state between episodes."""
+        pass

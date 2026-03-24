@@ -1,10 +1,12 @@
 # alpha-transformer
 
-Decision Transformer for sequential decision-making. Trains causal transformers via supervised learning on expert trajectories, conditioned on desired returns.
+Distributed data collection + Decision Transformer / LeWM world models for sequential decision-making. Collects trajectories at scale on AKS sandbox pods, trains models on a single GPU.
 
-**Supported environments** (via [sandbox-arena](https://github.com/chokevin/sandbox-arena)):
-- **Snake** — 10×10 grid game, discrete actions, dense reward (**primary, proven domain**)
-- **Commodities** — Multi-asset trading, continuous actions (experimental)
+**What this repo adds over the official [le-wm](https://github.com/lucas-maes/le-wm):**
+- **Distributed data collection** via [sandbox-arena](https://github.com/chokevin/sandbox-arena) AKS pods (50+ parallel collectors)
+- **HDF5 dataset generation** compatible with `stable-worldmodel` format
+- **Multiple environments** (Snake, commodities) with self-contained episode scripts
+- **Decision Transformer** comparison baseline
 
 ## Results
 
@@ -50,6 +52,19 @@ Commodity trading has noisy rewards which cause RL action collapse. SFT-only wor
 # Install
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
+# Collect data locally
+python collect_distributed.py --env snake --episodes 5000 --local
+
+# Collect data on AKS (50 parallel pods, ~10x faster)
+./sandbox/deploy.sh  # one-time setup
+python collect_distributed.py --env snake --episodes 10000 --batch 50 --parallel 50
+
+# Train Decision Transformer on Snake
+python train_snake.py --phase all
+
+# Train LeWM world model on Snake
+python train_lewm_snake.py --phase all
 
 # Full pipeline: collect → SFT → RL → evaluate
 python train.py --phase all

@@ -188,9 +188,6 @@ print(json.dumps({{
 '''
 
 PUSHT_EPISODE_SCRIPT = '''
-import subprocess, sys
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "gym-pusht", "pymunk<7"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
 import json
 import numpy as np
 
@@ -530,6 +527,10 @@ def main():
         print(f"Filtered: {len(trajectories)}/{before} (threshold={threshold:.2f})")
 
     # Save
+    if not trajectories:
+        print("No trajectories collected. Nothing to save.")
+        return
+
     base = args.output or f"results/{args.env}_data_{len(trajectories)}"
     if args.format in ("json", "both"):
         save_json(trajectories, f"{base}.json")

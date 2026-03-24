@@ -8,7 +8,7 @@ spec:
     spec:
       containers:
       - name: collector
-        image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/python-runtime-sandbox:latest-main
+        image: suliregistry.azurecr.io/alpha-sandbox:latest
         ports:
         - containerPort: 8888
         readinessProbe:

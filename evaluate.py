@@ -6,50 +6,23 @@ import numpy as np
 import torch
 from pathlib import Path
 from envs.commodities import CommodityTradingEnv
+from envs.features import STATE_DIM
+from model.transformer import TradingTransformer
+from model.policy import run_episode, load_checkpoint
 
 
 def load_model(path="results/trading_transformer.pt"):
-    from train import TradingTransformer
-    model = TradingTransformer()
-    model.load_state_dict(torch.load(path, weights_only=True))
+    model, metadata = load_checkpoint(path, TradingTransformer)
     model.eval()
     return model
 
 
-def run_episode(model, env, deterministic=True):
-    obs, _ = env.reset()
-    states_buf, actions_buf = [], []
-    done = False
-    while not done:
-        states_buf.append(obs)
-        seq_len = min(len(states_buf), model.max_seq_len)
-        s = torch.tensor(np.array(states_buf[-seq_len:]),
-                        dtype=torch.float32).unsqueeze(0)
-        if actions_buf:
-            a_len = min(len(actions_buf), seq_len)
-            a = torch.tensor(np.array(actions_buf[-a_len:]),
-                            dtype=torch.float32).unsqueeze(0)
-            if a.shape[1] < s.shape[1]:
-                pad = torch.zeros(1, s.shape[1] - a.shape[1], model.action_dim)
-                a = torch.cat([pad, a], dim=1)
-        else:
-            a = torch.zeros(1, seq_len, model.action_dim)
-        r = torch.full((1, seq_len, 1), 0.2, dtype=torch.float32)
-
-        with torch.no_grad():
-            action = model.get_action(s, a, r, deterministic=deterministic)
-        action = action.squeeze(0).numpy()
-        actions_buf.append(action)
-        obs, _, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
-    return info
-
-
-def evaluate(model, n_episodes=100):
+def evaluate(model, n_episodes=100, target_return=20.0):
     results = []
     for _ in range(n_episodes):
         env = CommodityTradingEnv(n_days=252)
-        info = run_episode(model, env)
+        info, _ = run_episode(model, env, target_return=target_return,
+                              deterministic=True)
         results.append(info)
     return results
 
@@ -75,6 +48,7 @@ def main():
         return
 
     model = load_model(model_path)
+    print(f"Model: {model.param_count():,} parameters")
     print("Evaluating (100 episodes each)...\n")
 
     agent_results = evaluate(model, 100)
@@ -83,17 +57,30 @@ def main():
     agent_returns = [r.get("total_return", 0) for r in agent_results]
     bh_returns = [r.get("total_return", 0) for r in bh_results]
     agent_sharpes = [r.get("sharpe", 0) for r in agent_results]
+    agent_drawdowns = [r.get("max_drawdown", 0) for r in agent_results]
 
-    print(f"{'='*50}")
-    print(f"{'Model':<20} {'Return':>8} {'Std':>8} {'Win%':>6} {'Sharpe':>8}")
-    print(f"{'='*50}")
-    print(f"{'Transformer':<20} {np.mean(agent_returns):>7.2f}% {np.std(agent_returns):>7.2f}% "
+    print(f"{'='*60}")
+    print(f"{'Model':<20} {'Return':>8} {'Std':>8} {'Win%':>6} {'Sharpe':>8} {'MaxDD':>8}")
+    print(f"{'='*60}")
+    print(f"{'Transformer':<20} {np.mean(agent_returns):>+7.2f}% {np.std(agent_returns):>7.2f}% "
           f"{sum(1 for r in agent_returns if r > 0)/len(agent_returns)*100:>5.0f}% "
-          f"{np.mean(agent_sharpes):>7.3f}")
-    print(f"{'Buy & Hold':<20} {np.mean(bh_returns):>7.2f}% {np.std(bh_returns):>7.2f}% "
-          f"{'—':>6} {'—':>8}")
-    print(f"{'='*50}")
+          f"{np.mean(agent_sharpes):>+7.3f} "
+          f"{np.mean(agent_drawdowns):>7.2f}%")
+    print(f"{'Buy & Hold':<20} {np.mean(bh_returns):>+7.2f}% {np.std(bh_returns):>7.2f}% "
+          f"{'—':>6} {'—':>8} {'—':>8}")
+    print(f"{'='*60}")
     print(f"{'Alpha':<20} {np.mean(agent_returns) - np.mean(bh_returns):>+7.2f}%")
+
+    # Save results
+    results_path = Path("results/evaluation.json")
+    results_path.parent.mkdir(exist_ok=True)
+    with open(results_path, "w") as f:
+        json.dump({
+            "agent": {"returns": agent_returns, "sharpes": agent_sharpes,
+                      "drawdowns": agent_drawdowns},
+            "baseline": {"returns": bh_returns},
+        }, f, indent=2)
+    print(f"\nSaved to {results_path}")
 
 
 if __name__ == "__main__":

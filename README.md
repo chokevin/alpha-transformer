@@ -2,7 +2,7 @@
 
 Decision Transformer for multi-commodity trading. Trains a causal transformer to trade Gold, Oil, Wheat, and Natural Gas using the pretrain → SFT → RL pipeline.
 
-Uses [sandbox-arena](https://github.com/chokevin/sandbox-arena) as the RL environment.
+Uses [sandbox-arena](https://github.com/chokevin/sandbox-arena) as the RL environment and supports distributed training on AKS.
 
 ## Architecture
 
@@ -11,11 +11,13 @@ Uses [sandbox-arena](https://github.com/chokevin/sandbox-arena) as the RL enviro
 │  alpha-transformer (this repo) │      │  sandbox-arena (environment) │
 │                                │      │                              │
 │  Decision Transformer          │ ───> │  Commodity trading env       │
-│  168K params, 3 layers         │ acts │  Gold, Oil, Wheat, NatGas    │
-│                                │      │  Realistic price dynamics    │
-│  Phase 1: Collect trajectories │ <─── │  Technical indicators        │
-│  Phase 2: SFT on good trajs   │ rwds │  Transaction costs           │
+│  899K params, 4 layers         │ acts │  Gold, Oil, Wheat, NatGas    │
+│  128 hidden, 52-dim state      │      │  Realistic price dynamics    │
+│                                │      │  Technical indicators        │
+│  Phase 1: Collect trajectories │ <─── │  Cross-commodity features    │
+│  Phase 2: SFT on top 20%      │ rwds │  Transaction costs           │
 │  Phase 3: RL fine-tuning       │      │                              │
+│  (PPO-style + entropy bonus)   │      │  Distributed via AKS pods   │
 └────────────────────────────────┘      └──────────────────────────────┘
 ```
 
@@ -23,13 +25,17 @@ Uses [sandbox-arena](https://github.com/chokevin/sandbox-arena) as the RL enviro
 
 ```bash
 # Install
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # Full pipeline: collect → SFT → RL → evaluate
 python train.py --phase all
 
 # Just RL fine-tuning (after SFT)
-python train.py --phase rl --episodes 2000
+python train.py --phase rl --rl-episodes 5000
+
+# Distributed RL on AKS (50 parallel sandbox pods)
+python train_distributed.py --episodes 5000 --batch 50 --parallel 50
 
 # Evaluate against baselines
 python evaluate.py
@@ -41,13 +47,13 @@ python visualize.py
 ## Training Pipeline
 
 ### Phase 1: Collect Trajectories
-Gather episodes from heuristic policies. Filter for profitable ones to avoid training on bad data.
+Gather episodes from diverse heuristic policies (Bollinger reversion, momentum, risk-parity). Filter for top 20% by return to train only on profitable patterns.
 
 ### Phase 2: Supervised Fine-Tuning (SFT)
-Train the transformer to predict actions from (state, return-to-go) sequences. The model learns to imitate profitable trading patterns.
+Train the transformer to predict actions from (state, return-to-go) sequences. Uses warmup + cosine LR decay. The model learns to imitate profitable trading patterns.
 
 ### Phase 3: RL Fine-Tuning
-REINFORCE against the live commodity environment. The model learns to improve beyond the SFT policy.
+PPO-style clipped policy gradient against the live commodity environment with entropy bonus for exploration. Saves best model by Sharpe ratio.
 
 ## Model
 
@@ -55,31 +61,38 @@ Causal transformer that treats trading as sequence modeling:
 
 | Component | Details |
 |-----------|---------|
-| Architecture | Causal transformer encoder |
-| Parameters | 168K |
-| Layers | 3 |
+| Architecture | Causal transformer encoder (pre-norm) |
+| Parameters | 899K |
+| Layers | 4 |
 | Heads | 4 |
-| Hidden dim | 64 |
+| Hidden dim | 128 |
 | Sequence length | 60 timesteps |
 | Input | Interleaved (return-to-go, state, action) tokens |
 | Output | Position sizes for 4 commodities (continuous [-1, 1]) |
 
-## Results
+## Features (52-dimensional state)
 
-| Model | Avg Return | Std | Win Rate | Sharpe | Alpha vs B&H |
-|-------|-----------|-----|----------|--------|--------------|
-| Buy & Hold | +3.1% | 7.2% | — | — | baseline |
-| Simple NN (REINFORCE) | -0.01% | 7.5% | 56% | 0.002 | -3.1% |
-| Decision Transformer (v1) | -0.17% | 0.3% | 32% | -0.49 | -3.2% |
-| **Target** | **>5%** | **<10%** | **>55%** | **>0.5** | **positive** |
+| Feature Group | Count | Details |
+|---------------|-------|---------|
+| Per-commodity | 10 × 4 = 40 | Returns (1/5/20d), MA ratios, realized vol, vol regime, RSI, Bollinger, momentum divergence |
+| Cross-commodity | 6 | Pairwise rolling correlations |
+| Portfolio state | 6 | Cash %, return, drawdown, time remaining, concentration (HHI), turnover |
 
-## What needs to improve
+## Reward Shaping
 
-1. **Better collection data** — filter for top 20% trajectories, add profitable heuristics
-2. **More RL episodes** — scale to 5000+ with sandbox-arena parallelism
-3. **Reward shaping** — penalize concentration, reward Sharpe not just returns
-4. **Features** — add volume, volatility regime, cross-commodity correlations
-5. **Architecture** — try MoE, longer context, attention to specific commodities
+- **Sharpe contribution**: daily return / rolling volatility
+- **Drawdown penalty**: penalize distance from peak
+- **Concentration penalty**: Herfindahl index of position weights
+- **Turnover penalty**: transaction cost awareness
+- **Terminal bonus**: episode Sharpe ratio − max drawdown
+
+## Config
+
+All hyperparameters are in `configs/default.yaml` and loaded automatically. CLI args override config values:
+
+```bash
+python train.py --hidden 256 --layers 6  # override model size
+```
 
 ## Project Structure
 
@@ -87,18 +100,36 @@ Causal transformer that treats trading as sequence modeling:
 alpha-transformer/
 ├── model/
 │   ├── transformer.py      # Decision Transformer architecture
-│   └── policy.py           # Action selection + exploration
+│   └── policy.py           # Action selection, inference, checkpointing
 ├── envs/
-│   ├── commodities.py      # Commodity trading Gym env (from sandbox-arena)
-│   └── features.py         # Technical feature engineering
+│   ├── commodities.py      # Commodity trading Gym env
+│   └── features.py         # Technical + cross-commodity feature engineering
 ├── configs/
 │   └── default.yaml        # Hyperparameters
-├── train.py                # 3-phase training pipeline
+├── train.py                # 3-phase training pipeline (local)
+├── train_distributed.py    # Distributed RL via AKS sandbox pods
 ├── evaluate.py             # Evaluation against baselines
 ├── visualize.py            # Training curves + portfolio charts
 ├── requirements.txt
 └── results/                # Saved models + training logs
 ```
+
+## Distributed Training on AKS
+
+For large-scale RL, use sandbox-arena's AKS infrastructure:
+
+```bash
+# Prerequisites: AKS cluster with agent-sandbox controller
+cd ../sandbox-arena
+kubectl apply -f sandbox/sandbox-template.yaml
+kubectl apply -f sandbox/warm-pool.yaml
+
+# Run distributed training (50 parallel pods, ~10x faster)
+cd ../alpha-transformer
+python train_distributed.py --episodes 5000 --batch 50 --parallel 50
+```
+
+Each episode runs in an isolated sandbox pod. The trainer dispatches batches via `k8s-agent-sandbox`, collects trajectories, and updates the model locally.
 
 ## Relationship to sandbox-arena
 
@@ -107,4 +138,4 @@ This repo is the **model**. [sandbox-arena](https://github.com/chokevin/sandbox-
 - sandbox-arena provides the `CommodityTradingEnv` Gym environment
 - sandbox-arena handles distributed episode collection across AKS pods
 - This repo handles model architecture, training, and evaluation
-- To train distributed: use `sandbox-arena/train_distributed.py` with this model's weights
+- Clone both side-by-side: `~/dev/alpha-transformer/` and `~/dev/sandbox-arena/`

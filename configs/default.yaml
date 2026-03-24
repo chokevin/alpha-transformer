@@ -1,14 +1,14 @@
 # Default training configuration
 model:
-  hidden_dim: 64
+  hidden_dim: 128
   n_heads: 4
-  n_layers: 3
+  n_layers: 4
   max_seq_len: 60
   dropout: 0.1
 
 collect:
-  episodes: 500
-  min_return_percentile: 50  # only keep top 50% trajectories for SFT
+  episodes: 1000
+  min_return_percentile: 80  # keep top 20% trajectories for SFT
 
 sft:
   epochs: 50

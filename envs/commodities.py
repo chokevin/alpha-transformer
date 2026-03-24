@@ -4,10 +4,8 @@ Simulates trading Gold, Oil, Wheat, and Natural Gas with:
 - Historical-like price patterns (trend, mean-reversion, volatility clustering)
 - Transaction costs (spread + commission)
 - Position sizing (fractional, not just all-in)
-- Multiple technical indicators as observations
-- Portfolio management across multiple commodities
-
-This is a proper trading environment suitable for RL training.
+- Enhanced technical indicators + cross-commodity features
+- Sharpe-based reward shaping with concentration/turnover penalties
 """
 
 import numpy as np
@@ -18,6 +16,13 @@ try:
 except ImportError:
     import gym
     from gym import spaces
+
+from envs.features import (
+    compute_commodity_features,
+    compute_cross_commodity_features,
+    compute_portfolio_features,
+    STATE_DIM,
+)
 
 
 # Realistic commodity parameters (annualized)
@@ -62,71 +67,17 @@ def generate_prices(params: dict, start_price: float, n_days: int,
     return prices
 
 
-def compute_features(prices: np.ndarray, idx: int) -> np.ndarray:
-    """Compute technical features for a single commodity at time idx."""
-    if idx < 20:
-        lookback = max(idx, 1)
-    else:
-        lookback = 20
-
-    window = prices[max(0, idx-lookback+1):idx+1]
-    current = prices[idx]
-
-    # Returns
-    ret_1d = (prices[idx] / prices[max(0, idx-1)] - 1) if idx > 0 else 0
-    ret_5d = (prices[idx] / prices[max(0, idx-5)] - 1) if idx >= 5 else 0
-    ret_20d = (prices[idx] / prices[max(0, idx-20)] - 1) if idx >= 20 else 0
-
-    # Moving averages
-    ma5 = np.mean(prices[max(0, idx-4):idx+1])
-    ma20 = np.mean(window)
-
-    # Volatility (annualized)
-    if len(window) > 1:
-        log_rets = np.diff(np.log(window))
-        vol = np.std(log_rets) * np.sqrt(252) if len(log_rets) > 0 else 0
-    else:
-        vol = 0
-
-    # RSI (14-day)
-    if idx >= 14:
-        deltas = np.diff(prices[idx-14:idx+1])
-        gains = np.mean(deltas[deltas > 0]) if np.any(deltas > 0) else 0
-        losses = -np.mean(deltas[deltas < 0]) if np.any(deltas < 0) else 0
-        rs = gains / (losses + 1e-10)
-        rsi = 100 - 100 / (1 + rs)
-    else:
-        rsi = 50
-
-    # Bollinger band position (-1 to 1)
-    if len(window) > 1:
-        std = np.std(window)
-        bb_pos = (current - ma20) / (2 * std + 1e-10)
-    else:
-        bb_pos = 0
-
-    return np.array([
-        ret_1d, ret_5d, ret_20d,         # momentum
-        current / ma5 - 1,               # price vs MA5
-        current / ma20 - 1,              # price vs MA20
-        vol,                              # realized volatility
-        rsi / 100 - 0.5,                 # RSI normalized to [-0.5, 0.5]
-        np.clip(bb_pos, -2, 2) / 2,      # Bollinger position normalized
-    ], dtype=np.float32)
-
-
 class CommodityTradingEnv(gym.Env):
-    """Multi-commodity trading environment.
+    """Multi-commodity trading environment with enhanced features and reward shaping.
 
-    Observation (per commodity × 8 features + portfolio state):
-        Per commodity: [ret_1d, ret_5d, ret_20d, price_vs_ma5, price_vs_ma20, vol, rsi, bb]
-        Portfolio: [cash_pct, total_return, drawdown, days_remaining]
+    Observation (52-dim):
+        Per commodity (10 × 4 = 40): returns, MA ratios, vol, vol regime, RSI, BB, momentum div
+        Cross-commodity (6): pairwise rolling correlations
+        Portfolio (6): cash, return, drawdown, time, concentration, turnover
 
-    Action (per commodity): continuous [-1, 1]
-        -1 = full short, 0 = no position, 1 = full long
-        The action represents target position as fraction of portfolio.
+    Action (4-dim): continuous [-1, 1] target position per commodity
 
-    Reward: daily Sharpe-like return (return / volatility)
+    Reward: Sharpe-based with concentration/turnover penalties
     """
 
     metadata = {"render_modes": []}
@@ -141,13 +92,9 @@ class CommodityTradingEnv(gym.Env):
         self.initial_cash = initial_cash
         self.commission_bps = commission_bps
 
-        # Features per commodity (8) + portfolio state (4) = 36 total
-        obs_dim = self.n_commodities * 8 + 4
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(STATE_DIM,), dtype=np.float32
         )
-
-        # Action: target position for each commodity [-1, 1]
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.n_commodities,), dtype=np.float32
         )
@@ -158,7 +105,6 @@ class CommodityTradingEnv(gym.Env):
         super().reset(seed=seed)
         self.rng = np.random.default_rng(seed)
 
-        # Generate price series for each commodity
         self.prices = {}
         for name, params in COMMODITIES.items():
             self.prices[name] = generate_prices(
@@ -167,9 +113,11 @@ class CommodityTradingEnv(gym.Env):
 
         self.day = 20  # start after enough history for features
         self.cash = self.initial_cash
-        self.positions = {name: 0.0 for name in self.commodity_names}  # units held
+        self.positions = {name: 0.0 for name in self.commodity_names}
+        self.prev_positions = {name: 0.0 for name in self.commodity_names}
         self.portfolio_values = [self.initial_cash]
         self.peak_value = self.initial_cash
+        self.daily_returns = []
 
         return self._get_obs(), {}
 
@@ -180,28 +128,40 @@ class CommodityTradingEnv(gym.Env):
         return val
 
     def _get_obs(self):
-        features = []
+        # Per-commodity features (10 each)
+        commodity_feats = []
         for name in self.commodity_names:
-            feat = compute_features(self.prices[name], self.day)
-            features.append(feat)
+            feat = compute_commodity_features(self.prices[name], self.day)
+            commodity_feats.append(feat)
 
+        # Cross-commodity correlations (6)
+        cross_feats = compute_cross_commodity_features(
+            self.prices, self.commodity_names, self.day
+        )
+
+        # Portfolio state (6)
         pv = self._portfolio_value()
-        total_return = (pv / self.initial_cash) - 1
-        drawdown = (self.peak_value - pv) / self.peak_value if self.peak_value > 0 else 0
-        days_remaining = (self.n_days - self.day) / self.n_days
+        current_prices = {name: self.prices[name][self.day] for name in self.commodity_names}
+        portfolio_feats = compute_portfolio_features(
+            cash=self.cash,
+            portfolio_value=pv,
+            initial_cash=self.initial_cash,
+            peak_value=self.peak_value,
+            day=self.day,
+            n_days=self.n_days,
+            positions=self.positions,
+            prices=current_prices,
+            prev_positions=self.prev_positions,
+        )
 
-        portfolio_state = np.array([
-            self.cash / pv if pv > 0 else 1.0,  # cash percentage
-            np.clip(total_return, -1, 5),        # total return
-            np.clip(drawdown, 0, 1),             # current drawdown
-            days_remaining,                       # time remaining
-        ], dtype=np.float32)
-
-        return np.concatenate(features + [portfolio_state])
+        return np.concatenate(commodity_feats + [cross_feats, portfolio_feats])
 
     def step(self, action):
         action = np.clip(action, -1, 1)
         pv_before = self._portfolio_value()
+
+        # Save previous positions for turnover calculation
+        self.prev_positions = {n: self.positions[n] for n in self.commodity_names}
 
         # Rebalance to target positions
         total_cost = 0
@@ -216,7 +176,6 @@ class CommodityTradingEnv(gym.Env):
                 spread = price * COMMODITIES[name]["spread_bps"] / 10000
                 commission = abs(trade_value) * self.commission_bps / 10000
 
-                # Execute trade
                 units = trade_value / price
                 self.positions[name] += units
                 self.cash -= trade_value + np.sign(trade_value) * spread * abs(units)
@@ -227,16 +186,39 @@ class CommodityTradingEnv(gym.Env):
         self.day += 1
         done = self.day >= self.n_days - 1
 
-        # Calculate reward
+        # Portfolio value after price move
         pv_after = self._portfolio_value()
         self.portfolio_values.append(pv_after)
         self.peak_value = max(self.peak_value, pv_after)
 
-        daily_return = (pv_after - pv_before) / pv_before if pv_before > 0 else 0
+        daily_return = (pv_after - pv_before) / pv_before if pv_before > 0 else 0.0
+        self.daily_returns.append(daily_return)
 
-        # Reward: risk-adjusted return (penalize drawdowns)
+        # --- Reward shaping ---
+        # 1) Sharpe contribution: risk-adjusted daily return
+        if len(self.daily_returns) > 5:
+            recent_std = np.std(self.daily_returns[-20:]) + 1e-8
+            sharpe_contribution = daily_return / recent_std
+        else:
+            sharpe_contribution = daily_return * 100
+
+        # 2) Drawdown penalty
         drawdown = (self.peak_value - pv_after) / self.peak_value
-        reward = daily_return * 100 - drawdown * 10  # scale for RL
+        drawdown_penalty = drawdown * 5
+
+        # 3) Concentration penalty (prefer diversified positions)
+        weights = []
+        for name in self.commodity_names:
+            w = abs(self.positions[name] * self.prices[name][self.day]) / pv_after if pv_after > 0 else 0
+            weights.append(w)
+        hhi = sum(w ** 2 for w in weights)
+        concentration_penalty = hhi * 2  # penalize concentrated bets
+
+        # 4) Turnover penalty (penalize excessive trading)
+        turnover = total_cost / pv_before if pv_before > 0 else 0
+        turnover_penalty = turnover * 50
+
+        reward = sharpe_contribution - drawdown_penalty - concentration_penalty - turnover_penalty
 
         info = {
             "portfolio_value": round(pv_after, 2),
@@ -249,12 +231,20 @@ class CommodityTradingEnv(gym.Env):
         }
 
         if done:
-            # Final stats
-            returns = np.diff(self.portfolio_values) / np.array(self.portfolio_values[:-1])
+            returns = np.array(self.daily_returns)
             sharpe = np.mean(returns) / (np.std(returns) + 1e-10) * np.sqrt(252)
+            max_dd = 0
+            peak = self.portfolio_values[0]
+            for v in self.portfolio_values:
+                peak = max(peak, v)
+                dd = (peak - v) / peak
+                max_dd = max(max_dd, dd)
+
             info["sharpe"] = round(sharpe, 3)
+            info["max_drawdown"] = round(max_dd * 100, 2)
             info["final_value"] = round(pv_after, 2)
-            # Bonus for good Sharpe
-            reward += sharpe * 10
+
+            # Terminal bonus: reward Sharpe, penalize max drawdown
+            reward += sharpe * 15 - max_dd * 10
 
         return self._get_obs(), reward, done, False, info

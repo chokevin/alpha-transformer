@@ -1,0 +1,39 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lewm-gpu-train
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      nodeSelector:
+        hardware: gpu
+      containers:
+      - name: train
+        image: suliregistry.azurecr.io/alpha-train:latest
+        command: ["python", "train_lewm_gpu.py"]
+        args:
+        - "--mode=pixel"
+        - "--episodes=100"
+        - "--epochs=50"
+        - "--lambd=0.032"
+        - "--batch-size=8"
+        - "--image-size=96"
+        - "--vit-hidden=192"
+        - "--vit-layers=6"
+        - "--vit-heads=3"
+        - "--embed-dim=192"
+        resources:
+          requests:
+            cpu: "2"
+            memory: "12Gi"
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "3"
+            memory: "24Gi"
+            nvidia.com/gpu: "1"

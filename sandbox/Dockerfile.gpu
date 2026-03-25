@@ -1,0 +1,23 @@
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
+
+WORKDIR /app
+
+# System deps for gym-pusht (pymunk needs gcc, opencv needs X libs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git build-essential libgl1 libglib2.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python deps
+RUN pip install --no-cache-dir \
+    numpy gymnasium h5py transformers "pymunk>=6.0,<7" "gym-pusht>=0.1.0"
+
+# Copy model code
+COPY model/ model/
+COPY planner.py .
+COPY train_lewm_gpu.py .
+COPY train_lewm_pusht.py .
+COPY collect_distributed.py .
+
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "train_lewm_gpu.py"]

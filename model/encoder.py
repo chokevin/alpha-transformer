@@ -105,7 +105,6 @@ class ViTEncoder(nn.Module):
             out = self.vit(flat, interpolate_pos_encoding=True)
             cls_token = out.last_hidden_state[:, 0]
             z = self.projector(cls_token)
-            z = self.projector(cls_token)
             return z.reshape(B, T, -1)
         else:
             out = self.vit(pixels, interpolate_pos_encoding=True)

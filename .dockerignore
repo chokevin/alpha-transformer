@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+results/
+.git/
+*.pyc
+*.pt
+*.h5
+*.npz
+*.json
+sandbox/Dockerfile
+sandbox/*.yaml
+sandbox/*.sh
+configs/
+envs/
+*.md

@@ -8,3 +8,4 @@ k8s-agent-sandbox>=0.1.0
 gym-pusht>=0.1.0
 pymunk<7
 stable-worldmodel>=0.0.6
+transformers>=4.0.0

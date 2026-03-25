@@ -91,10 +91,11 @@ class Predictor(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # Output projection → embed_dim with BatchNorm
+        # Output projection (hidden → embed_dim)
+        # Use LayerNorm instead of BatchNorm to avoid NaN on small/degenerate batches
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dim, embed_dim),
-            nn.BatchNorm1d(embed_dim),
+            nn.LayerNorm(embed_dim),
         )
 
     def forward(self, z_seq, action_seq):
@@ -118,6 +119,8 @@ class Predictor(nn.Module):
 
         for block in self.blocks:
             h = block(h, act_emb, mask=mask)
+            # Clamp intermediate values to prevent NaN accumulation
+            h = h.clamp(-100, 100)
 
         pred = self.output_proj(h.reshape(B * T, -1))
         return pred.reshape(B, T, -1)

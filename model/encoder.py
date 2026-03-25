@@ -85,10 +85,11 @@ class ViTEncoder(nn.Module):
 
         vit_hidden = self.vit.config.hidden_size
 
-        # Projector with BatchNorm (critical for SIGReg — see LeWM paper)
+        # Projector — LayerNorm for stability (paper uses BN but it
+        # causes NaN on some batches; LN is more robust)
         self.projector = nn.Sequential(
             nn.Linear(vit_hidden, embed_dim),
-            nn.BatchNorm1d(embed_dim),
+            nn.LayerNorm(embed_dim),
         )
 
     def forward(self, pixels):
@@ -103,6 +104,7 @@ class ViTEncoder(nn.Module):
             flat = pixels.reshape(B * T, C, H, W)
             out = self.vit(flat, interpolate_pos_encoding=True)
             cls_token = out.last_hidden_state[:, 0]
+            z = self.projector(cls_token)
             z = self.projector(cls_token)
             return z.reshape(B, T, -1)
         else:

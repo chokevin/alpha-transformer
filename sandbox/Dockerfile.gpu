@@ -16,6 +16,7 @@ COPY model/ model/
 COPY planner.py .
 COPY train_lewm_gpu.py .
 COPY train_lewm_pusht.py .
+COPY experiment_lambda.py .
 COPY collect_distributed.py .
 
 ENV PYTHONUNBUFFERED=1

@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lewm-lambda-ablation
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      nodeSelector:
+        hardware: gpu
+      containers:
+      - name: train
+        image: suliregistry.azurecr.io/alpha-train:latest
+        command: ["python", "experiment_lambda.py"]
+        args:
+        - "--episodes=200"
+        - "--epochs=50"
+        - "--batch-size=8"
+        - "--lambdas=0.01,0.032,0.1,0.32"
+        - "--image-size=96"
+        - "--vit-layers=6"
+        - "--vit-heads=3"
+        - "--embed-dim=192"
+        resources:
+          requests:
+            cpu: "2"
+            memory: "20Gi"
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "3"
+            memory: "24Gi"
+            nvidia.com/gpu: "1"

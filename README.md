@@ -116,11 +116,8 @@ alpha-transformer/
 │   ├── sandbox-template.yaml   # K8s SandboxTemplate
 │   ├── warm-pool.yaml          # Pre-warmed pod pool
 │   └── deploy.sh               # One-command AKS deployment
-├── envs/                       # Gym environments (Push-T via gym-pusht)
 └── results/                    # Saved models + datasets
 ```
-
-> **Legacy code:** `train.py`, `train_snake.py`, `envs/commodities.py`, and `model/transformer.py` are from earlier experiments (commodity trading, Snake game) that preceded the LeWM work. They are not actively used.
 
 ## Related Repos
 

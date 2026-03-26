@@ -1,47 +1,47 @@
 # alpha-transformer Agent Instructions
 
 ## What This Repo Does
-Distributed data collection for LeWM world models. Collects trajectories
-from Gym environments via AKS agent-sandbox pods, outputs HDF5 datasets
-compatible with stable-worldmodel.
+LeWM (Le World Model) reimplementation with ViT pixel training.
+Key finding: SIGReg λ=0.01–0.032 beats the paper's default λ=0.1 by 29%.
 
-## Data Collection
+## Training
 
 ```bash
-# Local collection
-source .venv/bin/activate
-python collect_distributed.py --env pusht --episodes 500 --local --format hdf5
+# GPU training (local or AKS)
+python train_lewm_gpu.py --mode pixel --episodes 200 --epochs 50 --lambd 0.032
 
-# Distributed via AKS (deploy infra first: ./sandbox/deploy.sh)
-python collect_distributed.py --env pusht --episodes 5000 --batch 15 --parallel 15 --format hdf5
-```
+# λ ablation experiment
+python experiment_lambda.py --episodes 200 --lambdas 0.01,0.032,0.1,0.32
 
-## Training (LeWM)
-
-Uses stable-worldmodel for data loading:
-```python
-from stable_worldmodel.data import HDF5Dataset
-ds = HDF5Dataset('pusht_5000', num_steps=16, cache_dir='results')
-```
-
-Or our standalone scripts:
-```bash
+# State-based Push-T training
 python train_lewm_pusht.py --phase all --episodes 500
-python train_lewm_snake.py --phase all --episodes 3000
 ```
 
-## AKS Deployment
+## GPU Training on AKS
 
 ```bash
-# Prerequisites: AKS cluster + agent-sandbox controller
-./sandbox/deploy.sh                     # Apply K8s configs
-python collect_distributed.py ...       # Collect data
-./sandbox/deploy.sh --teardown          # Clean up
+# Build image via ACR
+az acr build --subscription "AKS Airlock" --registry suliregistry \
+  --image alpha-train:latest -f sandbox/Dockerfile.gpu --platform linux/amd64 .
+
+# Submit job
+kubectl apply -f sandbox/gpu-train-job.yaml        # single training
+kubectl apply -f sandbox/lambda-ablation-job.yaml   # λ ablation
 ```
 
-## Adding a New Environment
+## Distributed Data Collection
 
-1. Write a self-contained episode script (see `SNAKE_EPISODE_SCRIPT` in collect_distributed.py)
-2. Add it to `collect_distributed.py` (local + distributed paths)
-3. If it needs native deps, add them to `sandbox/Dockerfile` and rebuild the image
-4. Test locally first: `--local`, then on AKS
+```bash
+# Local
+python collect_distributed.py --env pusht --episodes 500 --local
+
+# AKS pods (deploy infra first: ./sandbox/deploy.sh)
+python collect_distributed.py --env pusht --episodes 5000 --batch 15 --parallel 15
+```
+
+## Key Files
+- `experiment_lambda.py` — λ ablation (the novel finding)
+- `train_lewm_gpu.py` — ViT pixel training, GPU-optimized
+- `model/encoder.py` — MLP + ViT encoders
+- `model/predictor.py` — Transformer predictor with AdaLN
+- `model/sigreg.py` — SIGReg regularizer
